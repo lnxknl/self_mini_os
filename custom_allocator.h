@@ -3,18 +3,20 @@
 
 #include <linux/types.h>
 #include <linux/spinlock.h>
+#include <linux/rbtree.h>
 #include <linux/list.h>
 #include <linux/gfp.h>
 
 /* Memory block sizes */
-#define MIN_BLOCK_SIZE     32
-#define MAX_BLOCK_SIZE     (1 << 20)  /* 1MB */
-#define NUM_SIZE_CLASSES   12         /* From 32B to 1MB */
+#define MIN_BLOCK_ORDER  5    /* 32 bytes = 2^5 */
+#define MAX_BLOCK_ORDER  20   /* 1MB = 2^20 */
+#define BLOCK_MAGIC      0xDEADBEEF
 
-/* Memory pool flags */
-#define POOL_FLAG_CACHED   0x01    /* Use cache for fast allocation */
-#define POOL_FLAG_COMPACT  0x02    /* Keep memory compact */
-#define POOL_FLAG_PERSIST  0x04    /* Persistent memory pool */
+/* Memory block flags */
+#define BLOCK_FLAG_FREE     0x01
+#define BLOCK_FLAG_SPLIT    0x02
+#define BLOCK_FLAG_BUDDY    0x04
+#define BLOCK_FLAG_LEAF     0x08
 
 /* Error codes */
 #define ALLOC_SUCCESS      0
@@ -22,67 +24,63 @@
 #define ALLOC_ERROR_PARAM -2
 #define ALLOC_ERROR_INIT  -3
 
-/* Memory block header */
+/* Memory block node structure */
 struct mem_block {
-    size_t size;                  /* Block size including header */
+    struct rb_node node;          /* Red-black tree node */
+    struct list_head buddy_list;  /* List for buddy blocks */
+    void *start_addr;             /* Start address of block */
+    size_t size;                  /* Size of block */
+    unsigned int order;           /* Block order (power of 2) */
     unsigned int flags;           /* Block flags */
-    struct list_head list;        /* List of free/used blocks */
     unsigned long magic;          /* Magic number for validation */
-    unsigned char data[0];        /* Start of actual data */
+    struct mem_block *parent;     /* Parent block */
+    struct mem_block *left;       /* Left child (lower address) */
+    struct mem_block *right;      /* Right child (higher address) */
 };
 
-/* Size class information */
-struct size_class {
-    size_t size;                  /* Block size for this class */
-    struct list_head free_list;   /* List of free blocks */
-    unsigned int num_blocks;      /* Number of blocks in this class */
-    unsigned int max_blocks;      /* Maximum blocks allowed */
-    spinlock_t lock;             /* Lock for this size class */
+/* Free block tree structure */
+struct free_tree {
+    struct rb_root root;          /* Root of red-black tree */
+    struct list_head free_lists[MAX_BLOCK_ORDER + 1];  /* Free lists by order */
+    spinlock_t lock;              /* Tree lock */
 };
 
 /* Memory pool structure */
 struct mem_pool {
-    void *pool_start;            /* Start of pool memory */
-    void *pool_end;              /* End of pool memory */
-    size_t total_size;           /* Total size of pool */
-    size_t used_size;           /* Currently used size */
-    struct size_class classes[NUM_SIZE_CLASSES];  /* Size classes */
-    spinlock_t pool_lock;        /* Pool-wide lock */
-    unsigned int flags;          /* Pool flags */
-    struct list_head large_blocks; /* List of large blocks */
-};
-
-/* Cache structure for frequently allocated sizes */
-struct mem_cache {
-    size_t obj_size;            /* Size of each object */
-    struct list_head partial;   /* Partially full pages */
-    struct list_head full;      /* Full pages */
-    unsigned int objects_per_slab; /* Number of objects per slab */
-    size_t slab_size;          /* Size of each slab */
-    spinlock_t cache_lock;      /* Cache lock */
+    void *pool_start;             /* Start of pool memory */
+    void *pool_end;               /* End of pool memory */
+    size_t total_size;            /* Total size of pool */
+    size_t used_size;            /* Currently used size */
+    struct free_tree free_tree;   /* Tree of free blocks */
+    spinlock_t pool_lock;         /* Pool-wide lock */
+    struct mem_block *root_block; /* Root of block tree */
 };
 
 /* Statistics structure */
 struct mem_stats {
-    unsigned long allocs;       /* Number of allocations */
-    unsigned long frees;        /* Number of frees */
-    unsigned long fails;        /* Number of failed allocations */
-    size_t total_requested;    /* Total memory requested */
-    size_t total_allocated;    /* Total memory allocated */
-    size_t peak_usage;        /* Peak memory usage */
+    unsigned long allocs;         /* Number of allocations */
+    unsigned long frees;          /* Number of frees */
+    unsigned long splits;         /* Number of block splits */
+    unsigned long merges;         /* Number of block merges */
+    unsigned long fails;          /* Number of failed allocations */
+    size_t total_requested;      /* Total memory requested */
+    size_t total_allocated;      /* Total memory allocated */
+    size_t peak_usage;          /* Peak memory usage */
+    unsigned int fragmentation;  /* Fragmentation percentage */
 };
 
 /* Main allocator functions */
-int init_memory_pool(struct mem_pool *pool, size_t size, unsigned int flags);
+int init_memory_pool(struct mem_pool *pool, size_t size);
 void *mem_alloc(struct mem_pool *pool, size_t size);
 void mem_free(struct mem_pool *pool, void *ptr);
 int mem_pool_destroy(struct mem_pool *pool);
 
-/* Cache operations */
-struct mem_cache *create_mem_cache(size_t size, unsigned int flags);
-void *cache_alloc(struct mem_cache *cache);
-void cache_free(struct mem_cache *cache, void *ptr);
-void destroy_mem_cache(struct mem_cache *cache);
+/* Tree management functions */
+struct mem_block *find_free_block(struct free_tree *tree, unsigned int order);
+void insert_free_block(struct free_tree *tree, struct mem_block *block);
+void remove_free_block(struct free_tree *tree, struct mem_block *block);
+struct mem_block *split_block(struct mem_pool *pool, struct mem_block *block, unsigned int target_order);
+int merge_buddies(struct mem_pool *pool, struct mem_block *block);
 
 /* Memory pool maintenance */
 int mem_pool_trim(struct mem_pool *pool);
@@ -91,13 +89,15 @@ void mem_pool_stats(struct mem_pool *pool, struct mem_stats *stats);
 
 /* Debug functions */
 void dump_pool_info(struct mem_pool *pool);
+void dump_tree(struct mem_pool *pool);
 int validate_pool(struct mem_pool *pool);
 void debug_block(struct mem_block *block);
 
 /* Utility functions */
-size_t get_block_size(size_t requested_size);
+unsigned int get_block_order(size_t size);
 int is_power_of_two(size_t size);
 size_t align_size(size_t size);
-struct size_class *get_size_class(struct mem_pool *pool, size_t size);
+struct mem_block *get_buddy(struct mem_block *block);
+int are_buddies(struct mem_block *block1, struct mem_block *block2);
 
 #endif /* _CUSTOM_ALLOCATOR_H */

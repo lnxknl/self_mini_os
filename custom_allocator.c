@@ -3,22 +3,20 @@
 #include <linux/kernel.h>
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
+#include <linux/rbtree.h>
 #include "custom_allocator.h"
-
-#define BLOCK_MAGIC 0xDEADBEEF
-#define ALIGN_SIZE  8
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Custom Allocator Developer");
-MODULE_DESCRIPTION("Custom Memory Allocator");
+MODULE_DESCRIPTION("Tree-based Custom Memory Allocator");
 
 /* Initialize memory pool */
-int init_memory_pool(struct mem_pool *pool, size_t size, unsigned int flags) {
-    int i;
-    size_t class_size;
-
-    if (!pool || size < MIN_BLOCK_SIZE)
+int init_memory_pool(struct mem_pool *pool, size_t size) {
+    if (!pool || size < (1 << MIN_BLOCK_ORDER))
         return ALLOC_ERROR_PARAM;
+
+    /* Align size to maximum block order */
+    size = ALIGN(size, 1UL << MAX_BLOCK_ORDER);
 
     /* Allocate pool memory */
     pool->pool_start = vmalloc(size);
@@ -28,232 +26,292 @@ int init_memory_pool(struct mem_pool *pool, size_t size, unsigned int flags) {
     pool->pool_end = pool->pool_start + size;
     pool->total_size = size;
     pool->used_size = 0;
-    pool->flags = flags;
 
-    /* Initialize size classes */
-    class_size = MIN_BLOCK_SIZE;
-    for (i = 0; i < NUM_SIZE_CLASSES; i++) {
-        INIT_LIST_HEAD(&pool->classes[i].free_list);
-        pool->classes[i].size = class_size;
-        pool->classes[i].num_blocks = 0;
-        pool->classes[i].max_blocks = size / (class_size * 4); /* 25% per class */
-        spin_lock_init(&pool->classes[i].lock);
-        class_size *= 2;
+    /* Initialize free tree */
+    pool->free_tree.root = RB_ROOT;
+    spin_lock_init(&pool->free_tree.lock);
+
+    /* Initialize free lists */
+    for (int i = 0; i <= MAX_BLOCK_ORDER; i++) {
+        INIT_LIST_HEAD(&pool->free_tree.free_lists[i]);
     }
 
-    /* Initialize pool lock and large blocks list */
-    spin_lock_init(&pool->pool_lock);
-    INIT_LIST_HEAD(&pool->large_blocks);
+    /* Create root block */
+    pool->root_block = kzalloc(sizeof(struct mem_block), GFP_KERNEL);
+    if (!pool->root_block) {
+        vfree(pool->pool_start);
+        return ALLOC_ERROR_NOMEM;
+    }
+
+    /* Initialize root block */
+    pool->root_block->start_addr = pool->pool_start;
+    pool->root_block->size = size;
+    pool->root_block->order = ilog2(size);
+    pool->root_block->flags = BLOCK_FLAG_FREE;
+    pool->root_block->magic = BLOCK_MAGIC;
+    
+    /* Add root block to free tree */
+    insert_free_block(&pool->free_tree, pool->root_block);
 
     return ALLOC_SUCCESS;
 }
 
-/* Get appropriate size class for requested size */
-struct size_class *get_size_class(struct mem_pool *pool, size_t size) {
-    int i;
-    size_t class_size = MIN_BLOCK_SIZE;
+/* Find suitable free block of given order */
+struct mem_block *find_free_block(struct free_tree *tree, unsigned int order) {
+    struct mem_block *block;
+    struct rb_node *node;
+    unsigned int current_order = order;
 
-    for (i = 0; i < NUM_SIZE_CLASSES; i++) {
-        if (size <= class_size)
-            return &pool->classes[i];
-        class_size *= 2;
+    /* First try exact size match */
+    if (!list_empty(&tree->free_lists[order])) {
+        block = list_first_entry(&tree->free_lists[order], 
+                               struct mem_block, buddy_list);
+        return block;
     }
 
-    return NULL; /* Size too large for size classes */
+    /* Search for larger block that can be split */
+    while (current_order <= MAX_BLOCK_ORDER) {
+        if (!list_empty(&tree->free_lists[current_order])) {
+            block = list_first_entry(&tree->free_lists[current_order],
+                                   struct mem_block, buddy_list);
+            return block;
+        }
+        current_order++;
+    }
+
+    return NULL;
+}
+
+/* Insert block into free tree */
+void insert_free_block(struct free_tree *tree, struct mem_block *block) {
+    struct rb_node **new = &tree->root.rb_node, *parent = NULL;
+    struct mem_block *this;
+
+    /* Add to size-specific free list */
+    list_add(&block->buddy_list, &tree->free_lists[block->order]);
+
+    /* Insert into RB tree */
+    while (*new) {
+        parent = *new;
+        this = rb_entry(parent, struct mem_block, node);
+
+        if (block->start_addr < this->start_addr)
+            new = &parent->rb_left;
+        else
+            new = &parent->rb_right;
+    }
+
+    rb_link_node(&block->node, parent, new);
+    rb_insert_color(&block->node, &tree->root);
+}
+
+/* Remove block from free tree */
+void remove_free_block(struct free_tree *tree, struct mem_block *block) {
+    /* Remove from size-specific free list */
+    list_del(&block->buddy_list);
+
+    /* Remove from RB tree */
+    rb_erase(&block->node, &tree->root);
+}
+
+/* Split block into smaller blocks */
+struct mem_block *split_block(struct mem_pool *pool, struct mem_block *block, 
+                            unsigned int target_order) {
+    unsigned int current_order = block->order;
+    struct mem_block *buddy;
+
+    while (current_order > target_order) {
+        current_order--;
+
+        /* Create new buddy block */
+        buddy = kzalloc(sizeof(struct mem_block), GFP_KERNEL);
+        if (!buddy)
+            return NULL;
+
+        /* Configure buddy block */
+        buddy->start_addr = block->start_addr + (1UL << current_order);
+        buddy->size = 1UL << current_order;
+        buddy->order = current_order;
+        buddy->flags = BLOCK_FLAG_FREE | BLOCK_FLAG_BUDDY;
+        buddy->magic = BLOCK_MAGIC;
+        buddy->parent = block;
+
+        /* Update original block */
+        block->size = 1UL << current_order;
+        block->order = current_order;
+        block->flags |= BLOCK_FLAG_SPLIT;
+        block->right = buddy;
+        
+        /* Add buddy to free tree */
+        insert_free_block(&pool->free_tree, buddy);
+    }
+
+    return block;
+}
+
+/* Try to merge block with its buddy */
+int merge_buddies(struct mem_pool *pool, struct mem_block *block) {
+    struct mem_block *buddy, *parent;
+    void *buddy_addr;
+
+    while (block->parent) {
+        parent = block->parent;
+        
+        /* Calculate buddy address */
+        buddy_addr = block->start_addr ^ (1UL << block->order);
+        buddy = rb_entry(rb_next(&block->node), struct mem_block, node);
+
+        /* Check if buddy is free and same size */
+        if (!buddy || buddy->start_addr != buddy_addr || 
+            !(buddy->flags & BLOCK_FLAG_FREE) || 
+            buddy->order != block->order)
+            break;
+
+        /* Remove both blocks from tree */
+        remove_free_block(&pool->free_tree, block);
+        remove_free_block(&pool->free_tree, buddy);
+
+        /* Merge into parent */
+        parent->flags &= ~BLOCK_FLAG_SPLIT;
+        parent->flags |= BLOCK_FLAG_FREE;
+        insert_free_block(&pool->free_tree, parent);
+
+        block = parent;
+    }
+
+    return ALLOC_SUCCESS;
 }
 
 /* Allocate memory from pool */
 void *mem_alloc(struct mem_pool *pool, size_t size) {
-    struct size_class *class;
     struct mem_block *block;
-    size_t aligned_size;
+    unsigned int order;
     unsigned long flags;
 
     if (!pool || !size)
         return NULL;
 
-    /* Align size to boundary */
-    aligned_size = align_size(size + sizeof(struct mem_block));
+    /* Calculate required block order */
+    order = get_block_order(size + sizeof(struct mem_block));
 
-    /* Get appropriate size class */
-    class = get_size_class(pool, aligned_size);
-
-    if (class) {
-        /* Allocate from size class */
-        spin_lock_irqsave(&class->lock, flags);
-
-        if (!list_empty(&class->free_list)) {
-            /* Use existing block */
-            block = list_first_entry(&class->free_list, 
-                                   struct mem_block, list);
-            list_del(&block->list);
-            class->num_blocks--;
-        } else {
-            /* Create new block */
-            if (pool->used_size + class->size > pool->total_size) {
-                spin_unlock_irqrestore(&class->lock, flags);
-                return NULL;
-            }
-
-            block = pool->pool_start + pool->used_size;
-            block->size = class->size;
-            pool->used_size += class->size;
-        }
-
-        spin_unlock_irqrestore(&class->lock, flags);
-    } else {
-        /* Large allocation */
-        block = vmalloc(aligned_size);
-        if (!block)
-            return NULL;
-
-        block->size = aligned_size;
-        
-        spin_lock_irqsave(&pool->pool_lock, flags);
-        list_add(&block->list, &pool->large_blocks);
-        spin_unlock_irqrestore(&pool->pool_lock, flags);
+    /* Find and split suitable block */
+    spin_lock_irqsave(&pool->free_tree.lock, flags);
+    
+    block = find_free_block(&pool->free_tree, order);
+    if (!block) {
+        spin_unlock_irqrestore(&pool->free_tree.lock, flags);
+        return NULL;
     }
 
-    /* Initialize block */
-    block->flags = 0;
-    block->magic = BLOCK_MAGIC;
+    /* Remove from free tree */
+    remove_free_block(&pool->free_tree, block);
 
-    return block->data;
+    /* Split if necessary */
+    if (block->order > order) {
+        block = split_block(pool, block, order);
+        if (!block) {
+            spin_unlock_irqrestore(&pool->free_tree.lock, flags);
+            return NULL;
+        }
+    }
+
+    /* Mark block as used */
+    block->flags &= ~BLOCK_FLAG_FREE;
+    pool->used_size += block->size;
+
+    spin_unlock_irqrestore(&pool->free_tree.lock, flags);
+
+    return block->start_addr;
 }
 
 /* Free memory block */
 void mem_free(struct mem_pool *pool, void *ptr) {
     struct mem_block *block;
-    struct size_class *class;
     unsigned long flags;
 
     if (!pool || !ptr)
         return;
 
-    /* Get block header */
-    block = container_of(ptr, struct mem_block, data);
+    spin_lock_irqsave(&pool->free_tree.lock, flags);
 
-    /* Validate block */
-    if (block->magic != BLOCK_MAGIC) {
-        printk(KERN_ERR "Invalid block magic: possible corruption\n");
+    /* Find block in RB tree */
+    block = rb_entry(pool->free_tree.root.rb_node, struct mem_block, node);
+    while (block) {
+        if (ptr < block->start_addr)
+            block = rb_entry(block->node.rb_left, struct mem_block, node);
+        else if (ptr > block->start_addr)
+            block = rb_entry(block->node.rb_right, struct mem_block, node);
+        else
+            break;
+    }
+
+    if (!block || block->magic != BLOCK_MAGIC) {
+        spin_unlock_irqrestore(&pool->free_tree.lock, flags);
+        printk(KERN_ERR "Invalid free or corruption detected\n");
         return;
     }
 
-    /* Check if it's a large block */
-    if (block->size > pool->classes[NUM_SIZE_CLASSES-1].size) {
-        spin_lock_irqsave(&pool->pool_lock, flags);
-        list_del(&block->list);
-        spin_unlock_irqrestore(&pool->pool_lock, flags);
-        vfree(block);
-        return;
-    }
+    /* Mark block as free */
+    block->flags |= BLOCK_FLAG_FREE;
+    pool->used_size -= block->size;
 
-    /* Get size class */
-    class = get_size_class(pool, block->size);
-    if (!class) {
-        printk(KERN_ERR "Invalid block size\n");
-        return;
-    }
+    /* Add to free tree */
+    insert_free_block(&pool->free_tree, block);
 
-    /* Add to free list */
-    spin_lock_irqsave(&class->lock, flags);
-    list_add(&block->list, &class->free_list);
-    class->num_blocks++;
-    spin_unlock_irqrestore(&class->lock, flags);
-}
+    /* Try to merge with buddies */
+    merge_buddies(pool, block);
 
-/* Trim unused memory from pool */
-int mem_pool_trim(struct mem_pool *pool) {
-    struct size_class *class;
-    struct mem_block *block, *tmp;
-    int i;
-    unsigned long flags;
-
-    if (!pool)
-        return ALLOC_ERROR_PARAM;
-
-    /* Trim each size class */
-    for (i = 0; i < NUM_SIZE_CLASSES; i++) {
-        class = &pool->classes[i];
-        
-        spin_lock_irqsave(&class->lock, flags);
-        
-        list_for_each_entry_safe(block, tmp, &class->free_list, list) {
-            if (class->num_blocks > class->max_blocks) {
-                list_del(&block->list);
-                class->num_blocks--;
-                pool->used_size -= block->size;
-            }
-        }
-        
-        spin_unlock_irqrestore(&class->lock, flags);
-    }
-
-    return ALLOC_SUCCESS;
-}
-
-/* Get memory pool statistics */
-void mem_pool_stats(struct mem_pool *pool, struct mem_stats *stats) {
-    struct size_class *class;
-    int i;
-    unsigned long flags;
-
-    if (!pool || !stats)
-        return;
-
-    memset(stats, 0, sizeof(*stats));
-
-    /* Collect statistics from each size class */
-    for (i = 0; i < NUM_SIZE_CLASSES; i++) {
-        class = &pool->classes[i];
-        
-        spin_lock_irqsave(&class->lock, flags);
-        stats->total_allocated += class->num_blocks * class->size;
-        spin_unlock_irqrestore(&class->lock, flags);
-    }
-
-    stats->total_requested = pool->used_size;
-    stats->peak_usage = max(stats->peak_usage, pool->used_size);
+    spin_unlock_irqrestore(&pool->free_tree.lock, flags);
 }
 
 /* Utility functions */
-size_t align_size(size_t size) {
-    return (size + (ALIGN_SIZE - 1)) & ~(ALIGN_SIZE - 1);
-}
+unsigned int get_block_order(size_t size) {
+    unsigned int order = MAX_BLOCK_ORDER;
 
-int is_power_of_two(size_t size) {
-    return (size & (size - 1)) == 0;
+    while (order >= MIN_BLOCK_ORDER) {
+        if (size > (1UL << order))
+            return order + 1;
+        order--;
+    }
+
+    return MIN_BLOCK_ORDER;
 }
 
 /* Debug functions */
-void dump_pool_info(struct mem_pool *pool) {
-    struct size_class *class;
+void dump_tree(struct mem_pool *pool) {
+    struct rb_node *node;
+    struct mem_block *block;
     int i;
 
-    if (!pool)
-        return;
+    printk(KERN_INFO "Memory Pool Tree Dump:\n");
+    
+    /* Print free lists */
+    for (i = 0; i <= MAX_BLOCK_ORDER; i++) {
+        printk(KERN_INFO "Order %d free blocks:\n", i);
+        list_for_each_entry(block, &pool->free_tree.free_lists[i], buddy_list) {
+            printk(KERN_INFO "  Block: addr=%p size=%zu order=%u flags=%x\n",
+                   block->start_addr, block->size, block->order, block->flags);
+        }
+    }
 
-    printk(KERN_INFO "Memory Pool Info:\n");
-    printk(KERN_INFO "Total Size: %zu\n", pool->total_size);
-    printk(KERN_INFO "Used Size: %zu\n", pool->used_size);
-    printk(KERN_INFO "Flags: 0x%x\n", pool->flags);
-
-    for (i = 0; i < NUM_SIZE_CLASSES; i++) {
-        class = &pool->classes[i];
-        printk(KERN_INFO "Class %d (size %zu): %u blocks\n",
-               i, class->size, class->num_blocks);
+    /* Print RB tree */
+    printk(KERN_INFO "RB Tree blocks:\n");
+    for (node = rb_first(&pool->free_tree.root); node; node = rb_next(node)) {
+        block = rb_entry(node, struct mem_block, node);
+        printk(KERN_INFO "  Block: addr=%p size=%zu order=%u flags=%x\n",
+               block->start_addr, block->size, block->order, block->flags);
     }
 }
 
 /* Module initialization */
 static int __init custom_allocator_init(void) {
-    printk(KERN_INFO "Custom Memory Allocator loaded\n");
+    printk(KERN_INFO "Tree-based Custom Memory Allocator loaded\n");
     return 0;
 }
 
 /* Module cleanup */
 static void __exit custom_allocator_exit(void) {
-    printk(KERN_INFO "Custom Memory Allocator unloaded\n");
+    printk(KERN_INFO "Tree-based Custom Memory Allocator unloaded\n");
 }
 
 module_init(custom_allocator_init);
