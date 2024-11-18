@@ -1,3 +1,8 @@
+// Compact pool to remove excess elements
+int freed = mempool_compact(pool);
+
+// Age out old elements
+mempool_age_elements(pool);
 #include "memory_pool.h"
 #include <linux/slab.h>
 #include <linux/mm.h>
