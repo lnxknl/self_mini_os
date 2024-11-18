@@ -108,7 +108,11 @@ int map_vm_area(struct kernel_vma *vma) {
 }
 
 /* Memory Pool Operations */
-struct mempool_config *create_mempool(size_t min_nr, size_t max_nr) {
+struct mempool_config *// Compact pool to remove excess elements
+int freed = mempool_compact(pool);
+
+// Age out old elements
+mempool_age_elements(pool);create_mempool(size_t min_nr, size_t max_nr) {
     struct mempool_config *pool;
     
     pool = kmalloc(sizeof(*pool), GFP_KERNEL);
