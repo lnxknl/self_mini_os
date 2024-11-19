@@ -15,19 +15,30 @@ MODULE_DESCRIPTION("Demonstrates Linux kernel resource management concepts");
 static void demonstrate_memory_management(void) {
     struct page *page;
     void *mem;
+    int order;
     
     /* Buddy allocator example */
-    page = alloc_pages(GFP_KERNEL, 0);  /* Allocate 2^0 = 1 page */
-    if (page) {
-        pr_info("Successfully allocated a page\n");
-        __free_pages(page, 0);
+    for (order = 0; order < 3; order++) {
+        page = alloc_pages(GFP_KERNEL, order);  /* Allocate 2^order pages */
+        if (page) {
+            pr_info("Successfully allocated 2^%d = %d pages\n", 
+                   order, 1 << order);
+            __free_pages(page, order);
+        }
     }
     
-    /* Slab allocator example */
+    /* Slab allocator example - prevents internal fragmentation */
     mem = kmalloc(1024, GFP_KERNEL);  /* Allocate 1KB using slab */
     if (mem) {
         pr_info("Successfully allocated 1KB from slab\n");
         kfree(mem);
+    }
+    
+    /* Memory compaction example */
+    struct zone *zone = first_online_zone();
+    if (zone) {
+        int ret = compact_zone(zone, NULL);
+        pr_info("Memory compaction result: %d\n", ret);
     }
 }
 
