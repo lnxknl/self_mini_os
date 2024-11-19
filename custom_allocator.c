@@ -85,7 +85,7 @@ struct mem_block *find_free_block(struct free_tree *tree, unsigned int order) {
 /* Insert block into free tree */
 void insert_free_block(struct free_tree *tree, struct mem_block *block) {
     struct rb_node **new = &tree->root.rb_node, *parent = NULL;
-    struct mem_block *this;
+    struct mem_block *this; 
 
     /* Add to size-specific free list */
     list_add(&block->buddy_list, &tree->free_lists[block->order]);

@@ -1,0 +1,86 @@
+Linux Kernel Boot Sequence
+------------------------
+
+Power On
+   |
+   v
+[Hardware Init]
+   |
+   +-> POST (Power-On Self-Test)
+   |    - CPU Check
+   |    - Memory Check
+   |    - Hardware Tests
+   |
+   +-> BIOS/UEFI
+        |
+        v
+[Boot Loader - GRUB2]
+   |
+   +-> Stage 1 (boot.img)
+   |    - Load Stage 1.5
+   |
+   +-> Stage 1.5 (core.img)
+   |    - Filesystem Drivers
+   |    - Load Stage 2
+   |
+   +-> Stage 2
+        - Display Menu
+        - Load Kernel
+        |
+        v
+[Kernel Loading]
+   |
+   +-> Decompress Kernel
+   |    - Setup Initial Memory
+   |    - Jump to start_kernel()
+   |
+   +-> start_kernel()
+        |
+        v
+[Kernel Initialization]
+   |
+   +-> Architecture Setup
+   |    - CPU Init
+   |    - Memory Management
+   |
+   +-> Subsystem Init
+   |    - Scheduler
+   |    - Memory Manager
+   |    - Device Drivers
+   |
+   +-> Process 0 (swapper)
+        |
+        v
+[Init Process]
+   |
+   +-> Mount Root FS
+   |    - Read-only mount
+   |    - Switch root
+   |
+   +-> Start init (PID 1)
+        |
+        v
+[System Initialization]
+   |
+   +-> systemd/SysVinit
+   |    - Parse config
+   |    - Load modules
+   |
+   +-> Mount Filesystems
+   |    - According to fstab
+   |
+   +-> Start Services
+        - Network
+        - System daemons
+        |
+        v
+[User Space]
+   |
+   +-> User Services
+   |    - Display manager
+   |    - Network manager
+   |
+   +-> Login Prompt
+        |
+        v
+System Ready
