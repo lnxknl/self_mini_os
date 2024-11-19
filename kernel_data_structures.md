@@ -226,6 +226,80 @@
 - Network buffers
 - Driver data structures
 
+## 11. Graph Data Structures
+
+### 11.1 Dependency Graphs
+**Key Properties**:
+- Directed acyclic graphs (DAG)
+- Topological ordering
+- Cycle detection
+
+**Usage Scenarios**:
+- Module dependencies
+- Device driver dependencies
+- Power management relationships
+- Resource initialization ordering
+
+### 11.2 Device Tree Graphs
+**Key Properties**:
+- Hierarchical structure
+- Parent-child relationships
+- Property annotations
+
+**Usage Scenarios**:
+- Hardware device topology
+- Platform device enumeration
+- Resource allocation
+- Power domain relationships
+
+### 11.3 Network Graphs
+**Key Properties**:
+- Dynamic topology
+- Weighted edges
+- Connection tracking
+
+**Usage Scenarios**:
+- Network routing tables
+- Network namespace relationships
+- Network device relationships
+- Traffic control queuing disciplines
+
+### 11.4 Process Relationship Graphs
+**Key Properties**:
+- Parent-child relationships
+- Process groups
+- Session management
+
+**Usage Scenarios**:
+- Process hierarchy management
+- Process group signaling
+- Session management
+- Control group relationships
+
+### 11.5 Memory Zone Graphs
+**Key Properties**:
+- NUMA topology
+- Memory node relationships
+- Distance matrices
+
+**Usage Scenarios**:
+- NUMA memory management
+- Memory zone relationships
+- Memory migration decisions
+- Memory allocation policies
+
+### 11.6 Block I/O Graphs
+**Key Properties**:
+- I/O dependency tracking
+- Request merging
+- Priority relationships
+
+**Usage Scenarios**:
+- I/O scheduling
+- Block device stacking
+- RAID configurations
+- Device-mapper targets
+
 ## Implementation Considerations
 
 ### 1. Performance
