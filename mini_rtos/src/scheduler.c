@@ -233,6 +233,165 @@ void get_scheduler_stats(scheduler_stats_t *out_stats) {
     }
 }
 
+/* Add Task to Ready Queue */
+void scheduler_add_task(tcb_t *task) {
+    if (!task) return;
+    
+    enter_critical();
+    
+    uint8_t priority = task->priority;
+    
+    /* Add to priority queue */
+    task->next = ready_queue[priority];
+    if (ready_queue[priority]) {
+        ready_queue[priority]->prev = task;
+    }
+    ready_queue[priority] = task;
+    task->prev = NULL;
+    
+    /* Update ready groups bitmap */
+    ready_groups |= (1 << (priority >> 3));
+    ready_table[priority >> 3] |= (1 << (priority & 0x07));
+    
+    exit_critical();
+}
+
+/* Remove Task from Ready Queue */
+void scheduler_remove_task(tcb_t *task) {
+    if (!task) return;
+    
+    enter_critical();
+    
+    uint8_t priority = task->priority;
+    
+    /* Remove from priority queue */
+    if (task->prev) {
+        task->prev->next = task->next;
+    } else {
+        ready_queue[priority] = task->next;
+    }
+    
+    if (task->next) {
+        task->next->prev = task->prev;
+    }
+    
+    /* Update ready groups if queue is empty */
+    if (ready_queue[priority] == NULL) {
+        ready_table[priority >> 3] &= ~(1 << (priority & 0x07));
+        if (ready_table[priority >> 3] == 0) {
+            ready_groups &= ~(1 << (priority >> 3));
+        }
+    }
+    
+    task->next = task->prev = NULL;
+    
+    exit_critical();
+}
+
+/* Get Highest Priority Task */
+static tcb_t *get_highest_priority_task(void) {
+    if (ready_groups == 0) {
+        return idle_task;  /* No tasks ready, return idle task */
+    }
+    
+    /* Find highest priority group using CLZ (Count Leading Zeros) */
+    uint32_t group = 31 - __CLZ(ready_groups);
+    
+    /* Find highest priority task in group */
+    uint32_t priority_mask = ready_table[group];
+    uint32_t bit_pos = 31 - __CLZ(priority_mask);
+    uint32_t priority = (group << 3) + bit_pos;
+    
+    /* Return first task in that priority queue */
+    return ready_queue[priority] ? ready_queue[priority] : idle_task;
+}
+
+/* Start Scheduler */
+void scheduler_start(void) {
+    if (task_count == 0) {
+        return;  /* No tasks to run */
+    }
+    
+    /* Get first task to run */
+    next_task = get_highest_priority_task();
+    current_task = next_task;
+    
+    /* Initialize PSP for first task */
+    __set_PSP((uint32_t)next_task->stack_ptr);
+    
+    /* Switch to PSP */
+    __set_CONTROL(0x02);
+    __ISB();
+    
+    /* Enable PendSV interrupt */
+    NVIC_SetPriority(PendSV_IRQn, 0xFF);  /* Lowest priority */
+    
+    /* Start first task */
+    __asm volatile (
+        "MOV     R0, %0           \n"
+        "LDMIA   R0!, {R4-R11}    \n"
+        "MSR     PSP, R0          \n"
+        "MOV     LR, #0xFFFFFFFD  \n" /* Exception return using PSP */
+        "BX      LR               \n"
+        :: "r"(next_task->stack_ptr)
+    );
+}
+
+/* Schedule Next Task */
+void schedule_next_task(void) {
+    enter_critical();
+    
+    /* Update statistics */
+    if (current_task) {
+        current_task->run_time += (get_system_ticks() - current_task->last_run);
+    }
+    
+    /* Process any blocked tasks that might be ready */
+    process_blocked_tasks();
+    
+    /* Get next task to run */
+    next_task = get_highest_priority_task();
+    
+    if (next_task != current_task) {
+        /* Update task states and statistics */
+        if (current_task) {
+            if (current_task->state == TASK_RUNNING) {
+                current_task->state = TASK_READY;
+                scheduler_add_task(current_task);
+            }
+        }
+        
+        next_task->state = TASK_RUNNING;
+        next_task->last_run = get_system_ticks();
+        next_task->num_activations++;
+        scheduler_remove_task(next_task);
+        
+        stats.task_switches++;
+        
+        /* Trigger context switch */
+        SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+    }
+    
+    exit_critical();
+}
+
+/* Task Yield */
+void task_yield(void) {
+    enter_critical();
+    
+    if (current_task) {
+        /* Move current task to end of its priority queue */
+        current_task->ticks_remaining = current_task->time_slice;
+        current_task->state = TASK_READY;
+        scheduler_add_task(current_task);
+    }
+    
+    exit_critical();
+    
+    /* Schedule next task */
+    schedule_next_task();
+}
+
 /* Context Switch Handler (PendSV) */
 void PendSV_Handler(void) {
     /* Save current context */
