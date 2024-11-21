@@ -4,6 +4,7 @@
 #include "timer.h"
 #include <string.h>
 #include "hashtable.h"
+#include "traffic_control.h"
 
 /* Scheduler State */
 static tcb_t *current_task = NULL;
@@ -87,6 +88,9 @@ static void idle_task_func(void *arg) {
 
 /* Initialize Scheduler */
 void scheduler_init(void) {
+    /* Initialize traffic control */
+    tc_init();
+    
     /* Initialize hash tables */
     task_id_map = ht_create(MAX_TASKS, ht_hash_int, ht_compare_int);
     task_name_map = ht_create(MAX_TASKS, ht_hash_string, ht_compare_string);
@@ -160,6 +164,21 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
         (void *)((uint32_t)task->stack_base + stack_size),
         entry, arg
     );
+    
+    /* Assign traffic class based on priority */
+    traffic_class_t class;
+    if (priority >= TASK_PRIORITY_REALTIME) {
+        class = TC_REALTIME;
+    } else if (priority >= TASK_PRIORITY_HIGH) {
+        class = TC_INTERACTIVE;
+    } else if (priority >= TASK_PRIORITY_NORMAL) {
+        class = TC_BULK;
+    } else if (priority >= TASK_PRIORITY_LOW) {
+        class = TC_BACKGROUND;
+    } else {
+        class = TC_IDLE;
+    }
+    tc_assign_task_class(task, class);
     
     /* Add to trees */
     scheduler_add_task(task);
@@ -261,26 +280,13 @@ static void scheduler_remove_task(tcb_t *task) {
 
 /* Task State Management */
 void task_suspend(tcb_t *task) {
-    if (!task || task->state == TASK_SUSPENDED) return;
+    if (!task) return;
     
     enter_critical();
     
-    /* Remove from current queue */
-    if (task->state == TASK_READY) {
-        scheduler_remove_task(task);
-    } else if (task->state == TASK_BLOCKED) {
-        /* Remove from blocked list */
-        if (task->prev) task->prev->next = task->next;
-        if (task->next) task->next->prev = task->prev;
-        if (blocked_list == task) blocked_list = task->next;
-    }
-    
-    /* Add to suspended list */
-    task->next = suspended_list;
-    task->prev = NULL;
-    if (suspended_list) suspended_list->prev = task;
-    suspended_list = task;
     task->state = TASK_SUSPENDED;
+    /* Remove from traffic control queue */
+    tc_flush_queue(tc_get_task_class(task));
     
     exit_critical();
     
@@ -291,18 +297,13 @@ void task_suspend(tcb_t *task) {
 }
 
 void task_resume(tcb_t *task) {
-    if (!task || task->state != TASK_SUSPENDED) return;
+    if (!task) return;
     
     enter_critical();
     
-    /* Remove from suspended list */
-    if (task->prev) task->prev->next = task->next;
-    if (task->next) task->next->prev = task->prev;
-    if (suspended_list == task) suspended_list = task->next;
-    
-    /* Add to ready queue */
     task->state = TASK_READY;
-    scheduler_add_task(task);
+    /* Add back to traffic control queue */
+    tc_enqueue_task(task);
     
     exit_critical();
 }
@@ -502,59 +503,20 @@ void enable_preemption(void) {
 
 /* Enhanced Schedule Next Task */
 void schedule_next_task(void) {
-    enter_critical();
+    if (!tc_initialized) return;
     
-    /* Update statistics */
-    if (current_task) {
-        current_task->run_time += (get_system_ticks() - current_task->last_run);
-        
-        /* Check for deadline miss */
-        if ((current_task->flags & TASK_FLAG_DEADLINE) &&
-            get_system_ticks() > current_task->deadline) {
-            current_task->deadline_misses++;
-            stats.deadline_misses++;
-        }
-    }
-    
-    /* Process blocked tasks */
-    process_blocked_tasks();
-    
-    /* Get next task based on policy */
-    next_task = get_next_task();
-    
-    if (next_task != current_task) {
-        /* Check preemption */
-        if (preemption_mode == PREEMPT_DISABLE ||
-            (preemption_mode == PREEMPT_COND && 
-             current_task && 
-             (current_task->flags & TASK_FLAG_CRITICAL))) {
-            next_task = current_task;
-            exit_critical();
-            return;
-        }
-        
-        /* Update task states */
-        if (current_task) {
-            if (current_task->state == TASK_RUNNING) {
-                current_task->state = TASK_READY;
-                current_task->num_preemptions++;
-                stats.preemptions++;
-                scheduler_add_task(current_task);
-            }
-        }
-        
-        next_task->state = TASK_RUNNING;
-        next_task->last_run = get_system_ticks();
-        next_task->num_activations++;
-        scheduler_remove_task(next_task);
-        
+    /* Get next task from traffic control */
+    tcb_t *next = tc_dequeue_task();
+    if (next) {
+        current_task = next;
+        /* Update task state and statistics */
+        next->state = TASK_RUNNING;
+        next->num_activations++;
         stats.context_switches++;
         
         /* Trigger context switch */
         SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
     }
-    
-    exit_critical();
 }
 
 /* Start Scheduler */
@@ -625,4 +587,15 @@ void PendSV_Handler(void) {
         "MSR     PSP, R0          \n"
         "BX      LR               \n"
     );
+}
+
+/* Scheduler shutdown */
+void scheduler_shutdown(void) {
+    /* Shutdown traffic control */
+    tc_shutdown();
+    
+    /* Clear scheduler state */
+    current_task = NULL;
+    next_task = NULL;
+    task_count = 0;
 }
