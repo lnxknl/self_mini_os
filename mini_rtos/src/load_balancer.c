@@ -313,10 +313,39 @@ typedef struct {
     core_metrics_t metrics;
 } load_update_params_t;
 
+typedef struct {
+    lb_policy_t new_policy;
+    bool force_update;
+} policy_change_params_t;
+
+typedef struct {
+    uint32_t core_id;
+    uint32_t temperature;
+    bool emergency;
+} thermal_params_t;
+
+typedef struct {
+    uint32_t core_id;
+    uint32_t pressure;
+    bool force_rebalance;
+} memory_params_t;
+
 /* Async callbacks */
 static void migration_complete(void* context, async_status_t status, void* result) {
     if (status == ASYNC_STATUS_COMPLETED) {
         atomic_fetch_add_explicit_u64(&lb_state.stats.total_migrations, 1, MEMORY_ORDER_RELAXED);
+    }
+}
+
+static void thermal_complete(void* context, async_status_t status, void* result) {
+    if (status == ASYNC_STATUS_COMPLETED) {
+        atomic_fetch_add_explicit_u64(&lb_state.stats.thermal_throttling, 1, MEMORY_ORDER_RELAXED);
+    }
+}
+
+static void memory_complete(void* context, async_status_t status, void* result) {
+    if (status == ASYNC_STATUS_COMPLETED) {
+        atomic_fetch_add_explicit_u64(&lb_state.stats.memory_rebalances, 1, MEMORY_ORDER_RELAXED);
     }
 }
 
@@ -329,6 +358,24 @@ static bool handle_task_migration(void* params) {
 static bool handle_load_update(void* params) {
     load_update_params_t* lp = (load_update_params_t*)params;
     lb_update_metrics(lp->core_id, &lp->metrics);
+    return true;
+}
+
+static bool handle_policy_change(void* params) {
+    policy_change_params_t* pp = (policy_change_params_t*)params;
+    lb_adjust_policy(pp->new_policy);
+    return true;
+}
+
+static bool handle_thermal_adjust(void* params) {
+    thermal_params_t* tp = (thermal_params_t*)params;
+    lb_handle_thermal_event(tp->core_id, tp->temperature);
+    return true;
+}
+
+static bool handle_memory_rebalance(void* params) {
+    memory_params_t* mp = (memory_params_t*)params;
+    lb_handle_memory_pressure(mp->core_id, mp->pressure);
     return true;
 }
 
@@ -353,4 +400,38 @@ void lb_update_metrics_async(uint32_t core_id, core_metrics_t* metrics) {
     
     async_submit(ASYNC_OP_LOAD_UPDATE, &params, sizeof(params),
                 NULL, NULL, get_system_time_ms() + 100, 5);
+}
+
+void lb_adjust_policy_async(lb_policy_t new_policy, bool force_update) {
+    policy_change_params_t params = {
+        .new_policy = new_policy,
+        .force_update = force_update
+    };
+    
+    async_submit(ASYNC_OP_POLICY_CHANGE, &params, sizeof(params),
+                NULL, NULL, get_system_time_ms() + 500, 6);
+}
+
+void lb_handle_thermal_event_async(uint32_t core_id, uint32_t temperature, bool emergency) {
+    thermal_params_t params = {
+        .core_id = core_id,
+        .temperature = temperature,
+        .emergency = emergency
+    };
+    
+    uint32_t priority = emergency ? 9 : 7;
+    async_submit(ASYNC_OP_THERMAL_ADJUST, &params, sizeof(params),
+                thermal_complete, NULL, get_system_time_ms() + 200, priority);
+}
+
+void lb_handle_memory_pressure_async(uint32_t core_id, uint32_t pressure, bool force_rebalance) {
+    memory_params_t params = {
+        .core_id = core_id,
+        .pressure = pressure,
+        .force_rebalance = force_rebalance
+    };
+    
+    uint32_t priority = force_rebalance ? 8 : 6;
+    async_submit(ASYNC_OP_MEMORY_REBALANCE, &params, sizeof(params),
+                memory_complete, NULL, get_system_time_ms() + 300, priority);
 }

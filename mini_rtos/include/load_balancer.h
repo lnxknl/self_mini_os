@@ -82,4 +82,11 @@ void lb_handle_thermal_event(uint32_t core_id, uint32_t temperature);
 /* Memory pressure handling */
 void lb_handle_memory_pressure(uint32_t core_id, uint32_t pressure);
 
+/* Asynchronous operations */
+bool lb_migrate_task_async(uint32_t task_id, uint32_t src_core, uint32_t dst_core);
+void lb_update_metrics_async(uint32_t core_id, core_metrics_t* metrics);
+void lb_adjust_policy_async(lb_policy_t new_policy, bool force_update);
+void lb_handle_thermal_event_async(uint32_t core_id, uint32_t temperature, bool emergency);
+void lb_handle_memory_pressure_async(uint32_t core_id, uint32_t pressure, bool force_rebalance);
+
 #endif /* LOAD_BALANCER_H */
