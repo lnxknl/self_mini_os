@@ -104,6 +104,10 @@ void task_delete(tcb_t *task);
 void task_suspend(tcb_t *task);
 void task_resume(tcb_t *task);
 
+/* Task Lookup */
+tcb_t *find_task_by_id(uint32_t task_id);
+tcb_t *find_task_by_name(const char *name);
+
 /* Priority Management */
 void task_set_priority(tcb_t *task, uint8_t new_priority);
 void task_boost_priority(tcb_t *task, uint8_t boost_priority);

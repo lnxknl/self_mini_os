@@ -3,12 +3,17 @@
 #include "stm32f10x.h"
 #include "timer.h"
 #include <string.h>
+#include "hashtable.h"
 
 /* Scheduler State */
 static tcb_t *current_task = NULL;
 static tcb_t *next_task = NULL;
 static uint32_t task_count = 0;
 static scheduler_stats_t stats;
+
+/* Hash tables for task lookup */
+static hashtable_t *task_id_map;    /* Task ID to TCB mapping */
+static hashtable_t *task_name_map;  /* Task name to TCB mapping */
 
 /* RB-Trees for different scheduling policies */
 static rb_tree_t priority_tree;    /* For priority-based scheduling */
@@ -82,6 +87,10 @@ static void idle_task_func(void *arg) {
 
 /* Initialize Scheduler */
 void scheduler_init(void) {
+    /* Initialize hash tables */
+    task_id_map = ht_create(MAX_TASKS, ht_hash_int, ht_compare_int);
+    task_name_map = ht_create(MAX_TASKS, ht_hash_string, ht_compare_string);
+    
     /* Initialize RB-Trees */
     rb_init(&priority_tree, priority_key);
     rb_init(&deadline_tree, deadline_key);
@@ -104,6 +113,16 @@ void scheduler_init(void) {
         rb_insert(&priority_tree, idle_task);
         task_count++;
     }
+}
+
+/* Task lookup functions */
+tcb_t *find_task_by_id(uint32_t task_id) {
+    return (tcb_t *)ht_get(task_id_map, &task_id, sizeof(task_id));
+}
+
+tcb_t *find_task_by_name(const char *name) {
+    if (!name) return NULL;
+    return (tcb_t *)ht_get(task_name_map, name, strlen(name));
 }
 
 /* Task Creation */
@@ -145,6 +164,10 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
     /* Add to trees */
     scheduler_add_task(task);
     stats.total_tasks++;
+    
+    /* Add task to lookup tables */
+    ht_insert(task_id_map, &task->id, sizeof(task->id), task, sizeof(tcb_t *));
+    ht_insert(task_name_map, task->name, strlen(task->name), task, sizeof(tcb_t *));
     
     return task;
 }
@@ -190,6 +213,10 @@ static void scheduler_remove_task(tcb_t *task) {
     if (!task) return;
     
     enter_critical();
+    
+    /* Remove from hash tables */
+    ht_remove(task_id_map, &task->id, sizeof(task->id));
+    ht_remove(task_name_map, task->name, strlen(task->name));
     
     /* Remove from priority tree */
     rb_node_t *node = rb_find_task(&priority_tree, task);
