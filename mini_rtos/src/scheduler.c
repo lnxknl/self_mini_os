@@ -10,10 +10,25 @@ static tcb_t *next_task = NULL;
 static uint32_t task_count = 0;
 static scheduler_stats_t stats;
 
-/* Priority Queue for Ready Tasks */
-static tcb_t *ready_queue[MAX_PRIORITY_LEVELS];
-static uint32_t ready_groups = 0;
-static uint32_t ready_table[32];
+/* RB-Trees for different scheduling policies */
+static rb_tree_t priority_tree;    /* For priority-based scheduling */
+static rb_tree_t deadline_tree;    /* For EDF scheduling */
+static rb_tree_t rr_tree;         /* For round-robin scheduling */
+
+/* Key functions for different scheduling policies */
+static uint32_t priority_key(tcb_t *task) {
+    /* Invert priority so highest priority is lowest key */
+    return UINT32_MAX - ((uint32_t)task->priority << 24 | task->id);
+}
+
+static uint32_t deadline_key(tcb_t *task) {
+    return task->deadline;
+}
+
+static uint32_t rr_key(tcb_t *task) {
+    /* Use arrival time for FIFO ordering */
+    return task->arrival_time;
+}
 
 /* Task Lists */
 static tcb_t *blocked_list = NULL;
@@ -29,9 +44,6 @@ static uint32_t idle_stack[IDLE_TASK_STACK_SIZE/4];
 static sched_policy_t current_policy = SCHED_PRIORITY;
 static uint8_t preemption_mode = PREEMPT_ENABLE;
 static uint32_t default_time_slice = 10;  /* 10ms default time slice */
-
-/* EDF Queue */
-static tcb_t *edf_queue = NULL;
 
 /* Initialize Task Stack */
 static void *init_task_stack(void *stack_top, void (*entry)(void *), void *arg) {
@@ -70,24 +82,28 @@ static void idle_task_func(void *arg) {
 
 /* Initialize Scheduler */
 void scheduler_init(void) {
-    /* Clear task structures */
-    memset(task_pool, 0, sizeof(task_pool));
-    memset(&stats, 0, sizeof(stats));
+    /* Initialize RB-Trees */
+    rb_init(&priority_tree, priority_key);
+    rb_init(&deadline_tree, deadline_key);
+    rb_init(&rr_tree, rr_key);
     
-    /* Clear ready queue */
-    for (int i = 0; i < MAX_PRIORITY_LEVELS; i++) {
-        ready_queue[i] = NULL;
-    }
+    /* Initialize scheduler state */
+    current_task = NULL;
+    next_task = NULL;
+    task_count = 0;
+    current_policy = SCHED_PRIORITY;
+    preemption_mode = PREEMPT_ENABLE;
     
-    /* Initialize ready table */
-    for (int i = 0; i < 32; i++) {
-        ready_table[i] = 0;
-    }
-    ready_groups = 0;
+    /* Clear statistics */
+    memset(&stats, 0, sizeof(scheduler_stats_t));
     
     /* Create idle task */
-    idle_task = task_create("idle", idle_task_func, NULL, 
-                           TASK_PRIORITY_IDLE, IDLE_TASK_STACK_SIZE);
+    idle_task = create_idle_task();
+    if (idle_task) {
+        idle_task->priority = TASK_PRIORITY_IDLE;
+        rb_insert(&priority_tree, idle_task);
+        task_count++;
+    }
 }
 
 /* Task Creation */
@@ -126,11 +142,94 @@ tcb_t *task_create(const char *name, void (*entry)(void *), void *arg,
         entry, arg
     );
     
-    /* Add to ready queue */
+    /* Add to trees */
     scheduler_add_task(task);
     stats.total_tasks++;
     
     return task;
+}
+
+/* Add task to appropriate trees based on scheduling policy */
+static void scheduler_add_task(tcb_t *task) {
+    if (!task) return;
+    
+    enter_critical();
+    
+    /* Always add to priority tree */
+    rb_insert(&priority_tree, task);
+    
+    /* Add to policy-specific tree */
+    switch (current_policy) {
+        case SCHED_EDF:
+            if (task->flags & TASK_FLAG_DEADLINE) {
+                rb_insert(&deadline_tree, task);
+            }
+            break;
+            
+        case SCHED_RR:
+            rb_insert(&rr_tree, task);
+            break;
+            
+        case SCHED_HYBRID:
+            /* Add to both trees */
+            rb_insert(&rr_tree, task);
+            if (task->flags & TASK_FLAG_DEADLINE) {
+                rb_insert(&deadline_tree, task);
+            }
+            break;
+            
+        default:
+            break;
+    }
+    
+    exit_critical();
+}
+
+/* Remove task from trees */
+static void scheduler_remove_task(tcb_t *task) {
+    if (!task) return;
+    
+    enter_critical();
+    
+    /* Remove from priority tree */
+    rb_node_t *node = rb_find_task(&priority_tree, task);
+    if (node) {
+        rb_delete(&priority_tree, node);
+    }
+    
+    /* Remove from policy-specific tree */
+    switch (current_policy) {
+        case SCHED_EDF:
+            node = rb_find_task(&deadline_tree, task);
+            if (node) {
+                rb_delete(&deadline_tree, node);
+            }
+            break;
+            
+        case SCHED_RR:
+            node = rb_find_task(&rr_tree, task);
+            if (node) {
+                rb_delete(&rr_tree, node);
+            }
+            break;
+            
+        case SCHED_HYBRID:
+            /* Remove from both trees */
+            node = rb_find_task(&rr_tree, task);
+            if (node) {
+                rb_delete(&rr_tree, node);
+            }
+            node = rb_find_task(&deadline_tree, task);
+            if (node) {
+                rb_delete(&deadline_tree, node);
+            }
+            break;
+            
+        default:
+            break;
+    }
+    
+    exit_critical();
 }
 
 /* Task State Management */
@@ -241,153 +340,57 @@ void get_scheduler_stats(scheduler_stats_t *out_stats) {
     }
 }
 
-/* Add Task to Ready Queue */
-void scheduler_add_task(tcb_t *task) {
-    if (!task) return;
-    
-    enter_critical();
-    
-    uint8_t priority = task->priority;
-    
-    /* Add to priority queue */
-    task->next = ready_queue[priority];
-    if (ready_queue[priority]) {
-        ready_queue[priority]->prev = task;
-    }
-    ready_queue[priority] = task;
-    task->prev = NULL;
-    
-    /* Update ready groups bitmap */
-    ready_groups |= (1 << (priority >> 3));
-    ready_table[priority >> 3] |= (1 << (priority & 0x07));
-    
-    exit_critical();
-}
-
-/* Remove Task from Ready Queue */
-void scheduler_remove_task(tcb_t *task) {
-    if (!task) return;
-    
-    enter_critical();
-    
-    uint8_t priority = task->priority;
-    
-    /* Remove from priority queue */
-    if (task->prev) {
-        task->prev->next = task->next;
-    } else {
-        ready_queue[priority] = task->next;
-    }
-    
-    if (task->next) {
-        task->next->prev = task->prev;
-    }
-    
-    /* Update ready groups if queue is empty */
-    if (ready_queue[priority] == NULL) {
-        ready_table[priority >> 3] &= ~(1 << (priority & 0x07));
-        if (ready_table[priority >> 3] == 0) {
-            ready_groups &= ~(1 << (priority >> 3));
-        }
-    }
-    
-    task->next = task->prev = NULL;
-    
-    exit_critical();
-}
-
-/* Get Highest Priority Task */
-static tcb_t *get_highest_priority_task(void) {
-    if (ready_groups == 0) {
-        return idle_task;  /* No tasks ready, return idle task */
-    }
-    
-    /* Find highest priority group using CLZ (Count Leading Zeros) */
-    uint32_t group = 31 - __CLZ(ready_groups);
-    
-    /* Find highest priority task in group */
-    uint32_t priority_mask = ready_table[group];
-    uint32_t bit_pos = 31 - __CLZ(priority_mask);
-    uint32_t priority = (group << 3) + bit_pos;
-    
-    /* Return first task in that priority queue */
-    return ready_queue[priority] ? ready_queue[priority] : idle_task;
-}
-
-/* Get Next Task Based on Current Policy */
+/* Get next task based on current policy */
 static tcb_t *get_next_task(void) {
+    rb_node_t *node = NULL;
+    
     switch (current_policy) {
-        case SCHED_RR:
-            return get_next_rr_task();
-        case SCHED_EDF:
-            return get_next_edf_task();
-        case SCHED_HYBRID:
-            return get_next_hybrid_task();
         case SCHED_PRIORITY:
-        default:
-            return get_highest_priority_task();
-    }
-}
-
-/* Round Robin Scheduling */
-static tcb_t *get_next_rr_task(void) {
-    if (current_task && current_task->ticks_remaining > 0) {
-        return current_task;  /* Continue with current task */
-    }
-    
-    /* Find next ready task at same priority */
-    uint8_t priority = current_task ? current_task->priority : 0;
-    tcb_t *task = ready_queue[priority];
-    
-    if (task) {
-        /* Move to end of queue */
-        ready_queue[priority] = task->next;
-        if (task->next) {
-            task->next->prev = NULL;
-        }
-        
-        /* Reset time slice */
-        task->ticks_remaining = task->time_slice;
-        return task;
-    }
-    
-    /* No tasks at this priority, fall back to priority scheduling */
-    return get_highest_priority_task();
-}
-
-/* EDF Scheduling */
-static tcb_t *get_next_edf_task(void) {
-    tcb_t *best_task = NULL;
-    uint32_t earliest_deadline = UINT32_MAX;
-    
-    /* Find task with earliest deadline */
-    for (int i = 0; i < MAX_PRIORITY_LEVELS; i++) {
-        tcb_t *task = ready_queue[i];
-        while (task) {
-            if (task->flags & TASK_FLAG_DEADLINE) {
-                if (task->deadline < earliest_deadline) {
-                    earliest_deadline = task->deadline;
-                    best_task = task;
+            /* Get highest priority task (lowest key) */
+            node = rb_minimum(&priority_tree, priority_tree.root);
+            break;
+            
+        case SCHED_EDF:
+            /* Get earliest deadline task */
+            node = rb_minimum(&deadline_tree, deadline_tree.root);
+            if (!node || node == deadline_tree.nil) {
+                /* Fall back to priority if no deadline tasks */
+                node = rb_minimum(&priority_tree, priority_tree.root);
+            }
+            break;
+            
+        case SCHED_RR:
+            if (current_task && current_task->ticks_remaining > 0) {
+                return current_task;
+            }
+            /* Get next task in RR order */
+            node = rb_minimum(&rr_tree, rr_tree.root);
+            if (!node || node == rr_tree.nil) {
+                /* Fall back to priority if RR queue empty */
+                node = rb_minimum(&priority_tree, priority_tree.root);
+            }
+            break;
+            
+        case SCHED_HYBRID:
+            /* Get highest priority task */
+            node = rb_minimum(&priority_tree, priority_tree.root);
+            if (node && node != priority_tree.nil) {
+                /* If multiple tasks at same priority, use RR */
+                rb_node_t *next = rb_successor(&priority_tree, node);
+                if (next && next->key == node->key) {
+                    /* Use RR among same-priority tasks */
+                    if (current_task && 
+                        current_task->priority == node->task->priority &&
+                        current_task->ticks_remaining > 0) {
+                        return current_task;
+                    }
+                    node = rb_minimum(&rr_tree, rr_tree.root);
                 }
             }
-            task = task->next;
-        }
+            break;
     }
     
-    return best_task ? best_task : idle_task;
-}
-
-/* Hybrid Scheduling (Priority + RR) */
-static tcb_t *get_next_hybrid_task(void) {
-    tcb_t *highest = get_highest_priority_task();
-    
-    /* If multiple tasks at highest priority, use RR */
-    if (highest && highest->next && 
-        highest->next->priority == highest->priority) {
-        return get_next_rr_task();
-    }
-    
-    return highest;
+    return (node && node != priority_tree.nil) ? node->task : idle_task;
 }
 
 /* Priority Inheritance */
