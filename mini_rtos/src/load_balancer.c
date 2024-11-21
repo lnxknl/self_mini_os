@@ -1,6 +1,7 @@
 #include "load_balancer.h"
 #include "memory_order.h"
 #include <string.h>
+#include "async_ops.h"
 
 #define MAX_CORES 32
 #define THERMAL_THRESHOLD 85
@@ -298,4 +299,58 @@ void lb_handle_memory_pressure(uint32_t core_id, uint32_t pressure) {
     }
     
     mutex_unlock(lb_state.lock);
+}
+
+/* Async operation parameters */
+typedef struct {
+    uint32_t task_id;
+    uint32_t src_core;
+    uint32_t dst_core;
+} migration_params_t;
+
+typedef struct {
+    uint32_t core_id;
+    core_metrics_t metrics;
+} load_update_params_t;
+
+/* Async callbacks */
+static void migration_complete(void* context, async_status_t status, void* result) {
+    if (status == ASYNC_STATUS_COMPLETED) {
+        atomic_fetch_add_explicit_u64(&lb_state.stats.total_migrations, 1, MEMORY_ORDER_RELAXED);
+    }
+}
+
+/* Async operation handlers */
+static bool handle_task_migration(void* params) {
+    migration_params_t* mp = (migration_params_t*)params;
+    return lb_migrate_task(mp->task_id, mp->src_core, mp->dst_core);
+}
+
+static bool handle_load_update(void* params) {
+    load_update_params_t* lp = (load_update_params_t*)params;
+    lb_update_metrics(lp->core_id, &lp->metrics);
+    return true;
+}
+
+/* Async public interfaces */
+bool lb_migrate_task_async(uint32_t task_id, uint32_t src_core, uint32_t dst_core) {
+    migration_params_t params = {
+        .task_id = task_id,
+        .src_core = src_core,
+        .dst_core = dst_core
+    };
+    
+    uint32_t op_id = async_submit(ASYNC_OP_TASK_MIGRATION, &params, sizeof(params),
+                                 migration_complete, NULL, get_system_time_ms() + 1000, 8);
+    return op_id != 0;
+}
+
+void lb_update_metrics_async(uint32_t core_id, core_metrics_t* metrics) {
+    load_update_params_t params = {
+        .core_id = core_id
+    };
+    memcpy(&params.metrics, metrics, sizeof(core_metrics_t));
+    
+    async_submit(ASYNC_OP_LOAD_UPDATE, &params, sizeof(params),
+                NULL, NULL, get_system_time_ms() + 100, 5);
 }
